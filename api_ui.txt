@@ -1,0 +1,111 @@
+Perfect — Swagger UI will work well here, since auth is wired through `APIKeyHeader`, so you get a real **Authorize** button rather than having to paste a header on every request.
+
+**One thing to know up front:** the API only writes durable rows. It never evaluates inside a request, so Swagger alone will never produce results — you need the runner process too. Keep two terminals open.
+
+```powershell
+# Terminal 1 — the API
+cd C:\Users\chand\OneDrive\Documents\newevalplatform\eval-platform
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
+```
+
+## A. Authorize
+
+1. Open `http://localhost:8000/docs`
+2. Click the green **Authorize** button (top right), enter `change-me` (your `API_KEY`), click **Authorize**, then **Close**. Every call below now carries the header automatically.
+
+## B. Read-only probes (no auth needed)
+
+3. `GET /health/ready` → expect `200` with `postgres` and `storage` both ok. If this is `503`, stop — the database isn't reachable and nothing else will work.
+4. `GET /api/v1/evaluators` → expect 8 evaluators listed. This confirms the registry loaded.
+5. `GET /metrics` → Prometheus text output.
+
+## C. Store the evaluation config
+
+6. `POST /api/v1/evaluation-configs/validate` — dry run, nothing is stored. Open `examples/evaluation_config.json`, copy the **entire file**, and paste it as the request body (the file's top-level `name` / `description` / `config` keys already match the request schema). Expect `valid: true`, `checks_count: 8`, and the 8 `check_ids`.
+7. `POST /api/v1/evaluation-configs` — paste the same body. Expect `201`. **Copy the `id` from the response** — call it `CONFIG_ID`. Note `version: 1`; posting again later gives you version 2 rather than overwriting.
+
+## D. Create the dataset and payloads
+
+8. `POST /api/v1/datasets/upload` — easiest path in a browser, since Swagger gives you a file picker. Set `name` to `support-traces-web` and choose the file `examples/payload.json`. Expect `201`, `payload_count: 1`. **Copy `dataset_id`** — call it `DATASET_ID`.
+
+9. `POST /api/v1/payloads` — add a second, deliberately incomplete payload so the run shows off the missing-context policy instead of everything passing. Paste this, replacing `PASTE_DATASET_ID`:
+
+```json
+{
+  "dataset_id": "PASTE_DATASET_ID",
+  "external_payload_id": "pl-2026-01-05-0002",
+  "payload": {
+    "payload_metadata": { "payload_id": "pl-2026-01-05-0002", "version": "2026-01" },
+    "trace_data": { "trace_id": "tr-degraded-01", "session_id": "se-4472", "workflow_id": "support_triage" },
+    "session_context": {
+      "session_id": "se-4472",
+      "conversation_history": [
+        { "role": "user", "content": "My card was declined twice." },
+        { "role": "assistant", "content": "I retried the payment and it went through." }
+      ],
+      "final_response": "Your payment succeeded on the second attempt."
+    },
+    "spans": [
+      { "span_id": "sp-1", "agent_id": "classifier", "agent_type": "classifier", "order": 1,
+        "output": { "category": "billing", "confidence": 0.81 }, "tool_calls": [] },
+      { "span_id": "sp-2", "agent_id": "validator", "agent_type": "validator", "order": 2,
+        "output": { "is_valid": true }, "tool_calls": [] }
+    ]
+  }
+}
+```
+
+This one has no `summarizer` span, so every check mapped to `summarizer.*` becomes unresolvable.
+
+10. `GET /api/v1/payloads` with `dataset_id = DATASET_ID` → expect `total: 2`. Note each item's `trace_id` and `workflow_id` were extracted and indexed automatically.
+11. `GET /api/v1/payloads/{payload_id}` for either one → the full `payload_json` comes back verbatim, plus its `validation_report`. For the second payload the report should carry a warning about the missing span.
+12. `GET /api/v1/datasets/{DATASET_ID}/export` → streams both payloads back as JSONL, read straight from PostgreSQL.
+
+## E. Create the job
+
+13. `POST /api/v1/evaluation-jobs` with:
+
+```json
+{
+  "evaluation_config_id": "PASTE_CONFIG_ID",
+  "dataset_id": "PASTE_DATASET_ID",
+  "name": "web-walkthrough"
+}
+```
+
+Expect `201` with `payload_count: 2`, **`ticket_count: 16`** (2 payloads × 8 checks), and the 8 `check_ids`. **Copy the `job.id`** — call it `JOB_ID`.
+
+14. `GET /api/v1/evaluation-jobs/{JOB_ID}/tickets/summary` → expect `{"READY": 16}`. This is the proof that the API created durable work and evaluated nothing: 16 tickets are queued in PostgreSQL and no runner has touched them.
+15. `GET /api/v1/evaluation-jobs/{JOB_ID}` → `status: READY`, `progress_ratio: 0.0`, and `config_snapshot_json` holding the frozen copy of the config. That snapshot is why editing the config later can't change this job's behaviour.
+
+## F. Run the evaluation
+
+```powershell
+# Terminal 2 — the runner
+cd C:\Users\chand\OneDrive\Documents\newevalplatform\eval-platform
+.\.venv\Scripts\python.exe -m runner.main --drain
+```
+
+`--drain` processes everything runnable and exits, which is what you want for a one-shot test. Watch the JSON log lines: one `ticket_settled` per ticket, 16 total. The two `summary_faithfulness` tickets take a few seconds each since they call OpenAI (your `OPENAI_API_KEY` is set and `JUDGE_MODEL` is `gpt-4o-mini`, so these will really run and cost a fraction of a cent).
+
+## G. Read the results back in Swagger
+
+16. `GET /api/v1/evaluation-jobs/{JOB_ID}/results/summary` → pass/fail counts and average scores, aggregated in PostgreSQL. Expect a mix, not all green.
+17. `GET /api/v1/evaluation-jobs/{JOB_ID}/results` → all 16. The first payload should pass across the board; the second should show `PASSED` for `classifier_output_structure`, `FAILED` for the checks that can see the missing summarizer (`all_agents_ran`, `workflow_sequence`) and for `response_mentions_resolution` (its `final_response` never says "refund"), and `NOT_APPLICABLE` for the checks whose input mapping can't resolve at all (`summary_present`, `category_agreement`, `summary_faithfulness`).
+18. Filter to see the policy at work: same endpoint with `status = NOT_APPLICABLE`, then `status = FAILED`. The distinction is the whole point of `on_missing_context` — a payload that lacks an agent isn't scored as a failure.
+19. `GET /api/v1/results/{result_id}` on a `summary_faithfulness` result → `evidence_json` contains the prompt sent, the raw model response, the parsed verdict, token counts, latency, and estimated cost.
+20. `GET /api/v1/evaluation-jobs/{JOB_ID}/tickets` → copy any ticket `id`, then `GET /api/v1/tickets/{ticket_id}` → `input_snapshot_json` shows exactly what the context resolver handed the evaluator, and how each value was found.
+21. `GET /api/v1/evaluation-jobs/{JOB_ID}` again → `status: COMPLETED`, `progress_ratio: 1.0`, and `ticket_counts` totalling 16.
+
+## H. Operational endpoints, and two results that look like bugs but aren't
+
+22. `PATCH /api/v1/evaluation-configs/{CONFIG_ID}/status` with `{"status": "DEPRECATED"}` → succeeds, but only the lifecycle flag changes. The checks in version 1 stay immutable.
+23. `POST /api/v1/operations/recover-tickets` → runs the lease-recovery sweep on demand. Expect all zeros here, because nothing is abandoned.
+24. `POST /api/v1/evaluation-jobs/{JOB_ID}/retry-failed` → **expect `400 "no failed tickets to retry"`, and that's correct.** A *failed result* and a *failed ticket* are different things: your second payload produced `FAILED` results, but those tickets executed successfully and settled as `DONE`. Only tickets that errored out (exhausted transient retries, or hit a permanent error) become `FAILED` and are eligible for retry.
+25. To see cancellation, create a **second** job (repeat step 13) and call `POST /api/v1/evaluation-jobs/{NEW_JOB_ID}/cancel` **without** running the runner. Expect its 16 pending tickets to come back as `cancelled_tickets`. Calling cancel on the drained `JOB_ID` instead returns `409`, because a `COMPLETED` job can't be cancelled.
+
+## What "working correctly" looks like
+
+The run is healthy if `ticket_count` was 16, the runner logged 16 `ticket_settled` lines, the job ends `COMPLETED` with `progress_ratio: 1.0`, and the results are a *mix* of `PASSED`, `FAILED`, and `NOT_APPLICABLE`. All-passing would mean your second payload didn't land; any `ERROR` status means an evaluator or the LLM call genuinely broke, and the result's `error_code` and `error_message` will say which.
+
+One small note: `RATE_LIMIT` is `60/minute`, so if you click through Swagger very rapidly you may see a `429`. Just wait a moment and retry.
