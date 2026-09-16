@@ -1,0 +1,138 @@
+Here's the plan. eval-platform is 89 files (excluding .env, .venv/, __pycache__/, .ruff_cache/, and data/), and nothing in it imports evalforge-local, so it's fully self-contained — a file-by-file copy will work with zero rewrites as long as you keep the paths identical.
+
+The order below follows the real import graph, so at every checkpoint the code you've copied so far can actually be imported and run. The one rule that matters: a package's __init__.py that re-exports must be copied after its siblings, otherwise the import fails.
+
+Stage 0 — Create the folder and empty package markers
+Make your new folder (I'll call it <new-project>) and create these five files as empty files right away, since they contain nothing and every stage needs them to exist:
+
+app/api/__init__.py, app/core/__init__.py, app/db/__init__.py, app/services/__init__.py, tests/__init__.py
+
+Stage 1 — Root config (5 files)
+requirements.txt
+pyproject.toml
+.gitignore
+.env.example
+app/__init__.py — one line, holds __version__, which app/main.py and app/api/health.py both import
+Then: py -3 -m venv .venv and .\.venv\Scripts\python.exe -m pip install -r requirements.txt.
+
+Stage 2 — Core (5 files)
+app/core/config.py
+app/core/logging.py
+app/core/database.py
+app/core/metrics.py
+app/core/security.py
+These import nothing from app, so they're the true foundation. Checkpoint: .\.venv\Scripts\python.exe -c "from app.core.config import settings; print(settings.pgdatabase)"
+
+Stage 3 — Models and errors (4 files)
+app/models/enums.py
+app/models/entities.py
+app/models/__init__.py (re-exports — must come after the two above)
+app/services/errors.py — depends only on models/enums.py
+Stage 4 — Migrations and scripts (10 files)
+app/db/migrations/001_enums_and_datasets.sql
+app/db/migrations/002_evaluation_payloads.sql
+app/db/migrations/003_evaluation_configs.sql
+app/db/migrations/004_evaluation_jobs.sql
+app/db/migrations/005_evaluation_tickets.sql
+app/db/migrations/006_evaluation_results.sql
+app/db/migration_runner.py
+scripts/setup_databases.sql
+scripts/setup_databases.py
+scripts/migrate.py
+scripts/check_connection.py
+Now create your .env by hand from .env.example — do not copy the old .env, it has your real PGPASSWORD and OPENAI_API_KEY in it, and it's gitignored for that reason. Copy the values across manually.
+
+Checkpoint: .\.venv\Scripts\python.exe scripts\migrate.py upgrade then scripts\migrate.py status. All six migrations should apply. (If you point PGDATABASE at the existing eval_platform, the ledger will already show them applied and checksums must match — see the note at the bottom.)
+
+Stage 5 — Repositories (8 files)
+app/repositories/base.py
+app/repositories/dataset_repository.py
+app/repositories/payload_repository.py
+app/repositories/config_repository.py
+app/repositories/job_repository.py
+app/repositories/ticket_repository.py
+app/repositories/result_repository.py
+app/repositories/__init__.py (re-exports — last)
+Stage 6 — Storage (2 files)
+app/services/storage/local.py
+app/services/storage/__init__.py
+Stage 7 — Evaluators (19 files)
+Primitives first:
+
+app/evaluators/base.py
+app/evaluators/scoring.py
+app/evaluators/verifiers.py
+Deterministic evaluators, then their package init:
+
+app/evaluators/deterministic/required_fields.py
+app/evaluators/deterministic/json_schema.py
+app/evaluators/deterministic/workflow_order.py
+app/evaluators/deterministic/tool_calls.py
+app/evaluators/deterministic/cross_span_consistency.py
+app/evaluators/deterministic/__init__.py
+LLM providers, then the judge:
+
+app/evaluators/llm/providers/base.py
+app/evaluators/llm/providers/openai.py
+app/evaluators/llm/providers/anthropic.py
+app/evaluators/llm/providers/ollama.py
+app/evaluators/llm/providers/factory.py
+app/evaluators/llm/providers/__init__.py
+app/evaluators/llm/judge.py
+app/evaluators/llm/__init__.py
+Registry last, because it imports every evaluator above:
+
+app/evaluators/registry.py
+app/evaluators/__init__.py
+Checkpoint: .\.venv\Scripts\python.exe -c "from app.evaluators.registry import describe_evaluators; print(len(describe_evaluators()))" — expect 8.
+
+Stage 8 — Services (8 files)
+app/services/context_resolver.py — standalone, no app imports
+app/services/payload_validation.py
+app/services/config_validation.py
+app/services/dataset_ingestion.py
+app/services/ticket_service.py
+app/services/recovery_service.py
+app/services/evaluation_service.py
+app/services/job_service.py
+evaluation_service.py is the widest one (it pulls in evaluators, repositories, config_validation, context_resolver, and ticket_service), which is why it comes near the end.
+
+Stage 9 — API (8 files)
+app/schemas/__init__.py
+app/dependencies.py
+app/api/health.py
+app/api/payloads.py
+app/api/datasets.py
+app/api/configs.py
+app/api/jobs.py
+app/main.py
+Checkpoint: .\.venv\Scripts\python.exe -m uvicorn app.main:app --reload, then hit http://localhost:8000/health/ready and /docs.
+
+Stage 10 — Runner (3 files)
+runner/runner.py
+runner/main.py
+runner/__init__.py (imports runner.runner, so it goes last)
+Checkpoint: .\.venv\Scripts\python.exe -m runner.main --drain — it should start, reconcile, and exit cleanly.
+
+Stage 11 — Examples (2 files)
+examples/payload.json
+examples/evaluation_config.json
+Stage 12 — Tests (8 files)
+tests/conftest.py
+tests/test_migrations.py
+tests/test_context_resolver.py
+tests/test_config_validation.py
+tests/test_evaluators.py
+tests/test_orchestration.py
+tests/test_api.py
+tests/test_runner_end_to_end.py
+Final checkpoint: .\.venv\Scripts\python.exe -m pytest -q. This is the real proof the copy is complete — the suite hits a live eval_platform_test database and exercises concurrent claiming, lease recovery, cancellation, and result idempotency.
+
+Stage 13 — Docs
+README.md — copy it last so the walkthrough in it matches what you've just verified.
+Two things to watch
+Don't copy data/. data/storage-test/uploads/... is just leftover test artifacts, and data/storage/ gets created on demand from LOCAL_STORAGE_ROOT.
+
+Decide about the database before Stage 4. If your new .env keeps PGDATABASE=eval_platform, the new folder shares the existing database and its data — fine for a straight relocation. If you want the new project isolated, change PGDATABASE / TEST_PGDATABASE to new names and run scripts/setup_databases.sql (or the .py variant) first. Either way, don't edit any migration file while copying: the runner stores a checksum per applied migration and will reject a modified one rather than re-run it.
+
+Want me to just execute this copy into a folder you name, running the checkpoints as I go?
