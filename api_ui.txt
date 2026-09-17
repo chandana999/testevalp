@@ -28,6 +28,7 @@ cd C:\Users\chand\OneDrive\Documents\newevalplatform\eval-platform
 
 8. `POST /api/v1/datasets/upload` — easiest path in a browser, since Swagger gives you a file picker. Set `name` to `support-traces-web` and choose the file `examples/payload.json`. Expect `201`, `payload_count: 1`. **Copy `dataset_id`** — call it `DATASET_ID`.
 
+
 9. `POST /api/v1/payloads` — add a second, deliberately incomplete payload so the run shows off the missing-context policy instead of everything passing. Paste this, replacing `PASTE_DATASET_ID`:
 
 ```json
@@ -109,3 +110,9 @@ cd C:\Users\chand\OneDrive\Documents\newevalplatform\eval-platform
 The run is healthy if `ticket_count` was 16, the runner logged 16 `ticket_settled` lines, the job ends `COMPLETED` with `progress_ratio: 1.0`, and the results are a *mix* of `PASSED`, `FAILED`, and `NOT_APPLICABLE`. All-passing would mean your second payload didn't land; any `ERROR` status means an evaluator or the LLM call genuinely broke, and the result's `error_code` and `error_message` will say which.
 
 One small note: `RATE_LIMIT` is `60/minute`, so if you click through Swagger very rapidly you may see a `429`. Just wait a moment and retry.
+
+
+
+
+
+proj-4z48X2e3u0Hr53mqQ1b62sAtC7hTJNY1HgliRue5hqJ6jyVoTRqlcPx0y7qCc371cWPHVywvWOT3BlbkFJYI0wW4LaGpNe_ePMNo0J-uNgC3hOjv4hgEJpxHv_J3L7VJ1w0Mo--JjoX1wgAgfXX4Z8wqyw4A
